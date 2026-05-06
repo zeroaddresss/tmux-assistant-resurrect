@@ -1909,6 +1909,137 @@ else
 	fail "User settings lost during unconfigure"
 fi
 
+# --- Test 7e: Stale-path replacement (Nix/NixOS regression) ---
+#
+# On Nix/NixOS each rebuild produces a new /nix/store hash. The old
+# contains()-based check would see "yes, a claude-session-track hook
+# exists" and skip reinstall, leaving a stale (garbage-collected) path.
+# The fix compares on exact path equality and replaces stale entries.
+
+echo ""
+echo "=== Test 7e: Stale-path replacement (Nix/NixOS regression) ==="
+echo ""
+
+# Start fresh
+rm -f "$HOME/.claude/settings.json"
+echo '{}' >"$HOME/.claude/settings.json"
+
+# Inject hooks pointing at a fake old path (simulates a previous Nix derivation)
+stale_track="bash '/nix/store/old-hash-abc123/hooks/claude-session-track.sh'"
+stale_cleanup="bash '/nix/store/old-hash-abc123/hooks/claude-session-cleanup.sh'"
+tmp_stale=$(mktemp)
+jq --arg track "$stale_track" --arg cleanup "$stale_cleanup" '
+    .hooks = {
+        "SessionStart": [{
+            "matcher": "",
+            "hooks": [{"type": "command", "command": $track}]
+        }],
+        "SessionEnd": [{
+            "matcher": "",
+            "hooks": [{"type": "command", "command": $cleanup}]
+        }]
+    }
+' "$HOME/.claude/settings.json" >"$tmp_stale" && mv "$tmp_stale" "$HOME/.claude/settings.json"
+
+# Verify stale hooks are in place
+stale_before=$(jq '[.hooks.SessionStart[]?.hooks[]? | select(.command | contains("claude-session-track"))] | length' "$HOME/.claude/settings.json")
+assert_eq "Stale: old-path hook present before reinstall" "1" "$stale_before"
+
+# Run the plugin — should replace the stale path with the current one
+bash "$REPO_DIR/tmux-assistant-resurrect.tmux"
+
+# Exactly 1 SessionStart hook, not 2 (no duplicate)
+stale_start_count=$(jq '[.hooks.SessionStart[]?.hooks[]? | select(.command | contains("claude-session-track"))] | length' "$HOME/.claude/settings.json")
+assert_eq "Stale: exactly 1 SessionStart hook after reinstall" "1" "$stale_start_count"
+
+# The hook must point at the CURRENT path, not the old one
+stale_start_cmd=$(jq -r '.hooks.SessionStart[]?.hooks[]? | select(.command | contains("claude-session-track")) | .command' "$HOME/.claude/settings.json")
+expected_track_cmd="bash '${REPO_DIR}/hooks/claude-session-track.sh'"
+assert_eq "Stale: SessionStart hook updated to current path" "$expected_track_cmd" "$stale_start_cmd"
+
+# Same for SessionEnd
+stale_end_count=$(jq '[.hooks.SessionEnd[]?.hooks[]? | select(.command | contains("claude-session-cleanup"))] | length' "$HOME/.claude/settings.json")
+assert_eq "Stale: exactly 1 SessionEnd hook after reinstall" "1" "$stale_end_count"
+
+stale_end_cmd=$(jq -r '.hooks.SessionEnd[]?.hooks[]? | select(.command | contains("claude-session-cleanup")) | .command' "$HOME/.claude/settings.json")
+expected_cleanup_cmd="bash '${REPO_DIR}/hooks/claude-session-cleanup.sh'"
+assert_eq "Stale: SessionEnd hook updated to current path" "$expected_cleanup_cmd" "$stale_end_cmd"
+
+# Run again — should be idempotent (still exactly 1)
+bash "$REPO_DIR/tmux-assistant-resurrect.tmux"
+stale_idem_count=$(jq '[.hooks.SessionStart[]?.hooks[]? | select(.command | contains("claude-session-track"))] | length' "$HOME/.claude/settings.json")
+assert_eq "Stale: idempotent after path replacement" "1" "$stale_idem_count"
+
+# --- Test 7f: Stale path with other hooks preserved ---
+#
+# When a stale hook sits alongside an unrelated hook in the same entry,
+# only the stale hook should be removed; the unrelated one must survive.
+
+echo ""
+echo "=== Test 7f: Stale path replacement preserves unrelated hooks ==="
+echo ""
+
+rm -f "$HOME/.claude/settings.json"
+echo '{}' >"$HOME/.claude/settings.json"
+
+# Inject a SessionStart entry with BOTH a stale track hook and a user's custom hook
+tmp_mixed=$(mktemp)
+jq --arg stale "$stale_track" '
+    .hooks = {
+        "SessionStart": [{
+            "matcher": "",
+            "hooks": [
+                {"type": "command", "command": $stale},
+                {"type": "command", "command": "echo my-custom-hook"}
+            ]
+        }]
+    }
+' "$HOME/.claude/settings.json" >"$tmp_mixed" && mv "$tmp_mixed" "$HOME/.claude/settings.json"
+
+bash "$REPO_DIR/tmux-assistant-resurrect.tmux"
+
+# The custom hook must survive
+mixed_custom=$(jq '[.hooks.SessionStart[]?.hooks[]? | select(.command == "echo my-custom-hook")] | length' "$HOME/.claude/settings.json")
+assert_eq "Mixed: unrelated hook preserved after stale replacement" "1" "$mixed_custom"
+
+# Our hook is present with the current path
+mixed_track=$(jq '[.hooks.SessionStart[]?.hooks[]? | select(.command | contains("claude-session-track"))] | length' "$HOME/.claude/settings.json")
+assert_eq "Mixed: exactly 1 track hook after stale replacement" "1" "$mixed_track"
+
+# --- Test 7g: Stale path with null/missing hooks field ---
+#
+# An entry with "hooks": null or no hooks field at all must not crash
+# the jq cleanup filter (.hooks |= map(...) would fail without null-coalescing).
+
+echo ""
+echo "=== Test 7g: Stale path cleanup tolerates null hooks field ==="
+echo ""
+
+rm -f "$HOME/.claude/settings.json"
+cat >"$HOME/.claude/settings.json" <<'NULLEOF'
+{
+  "hooks": {
+    "SessionStart": [
+      {"matcher": "", "hooks": null},
+      {"matcher": "", "hooks": [{"type": "command", "command": "bash '/nix/store/old-hash/hooks/claude-session-track.sh'"}]}
+    ],
+    "SessionEnd": [
+      {"matcher": ""}
+    ]
+  }
+}
+NULLEOF
+
+null_exit=0
+bash "$REPO_DIR/tmux-assistant-resurrect.tmux" 2>&1 || null_exit=$?
+assert_eq "Null hooks: install doesn't crash" "0" "$null_exit"
+
+null_track=$(jq '[.hooks.SessionStart[]?.hooks[]? | select((.command // "") | contains("claude-session-track"))] | length' "$HOME/.claude/settings.json")
+assert_eq "Null hooks: exactly 1 track hook installed" "1" "$null_track"
+
+null_end=$(jq '[.hooks.SessionEnd[]?.hooks[]? | select((.command // "") | contains("claude-session-cleanup"))] | length' "$HOME/.claude/settings.json")
+assert_eq "Null hooks: exactly 1 cleanup hook installed" "1" "$null_end"
+
 # --- Test 8: strip_assistant_pane_contents() ---
 
 suite "strip_pane_contents"

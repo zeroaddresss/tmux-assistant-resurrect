@@ -72,7 +72,7 @@ install_claude_hooks() {
             .hooks.SessionStart //= [] |
             # Drop any prior instance of this hook (different paths included).
             .hooks.SessionStart |= map(
-                .hooks |= map(select((.command // "") | contains("claude-session-track") | not))
+                .hooks = ((.hooks // []) | map(select((.command // "") | contains("claude-session-track") | not)))
             ) |
             # Drop entries whose hooks list became empty after the filter.
             .hooks.SessionStart |= map(select((.hooks // []) | length > 0)) |
@@ -91,7 +91,7 @@ install_claude_hooks() {
             .hooks //= {} |
             .hooks.SessionEnd //= [] |
             .hooks.SessionEnd |= map(
-                .hooks |= map(select((.command // "") | contains("claude-session-cleanup") | not))
+                .hooks = ((.hooks // []) | map(select((.command // "") | contains("claude-session-cleanup") | not)))
             ) |
             .hooks.SessionEnd |= map(select((.hooks // []) | length > 0)) |
             .hooks.SessionEnd += [{
