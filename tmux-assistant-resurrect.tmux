@@ -50,21 +50,12 @@ install_claude_hooks() {
         return
     fi
 
-    # Install SessionStart hook, refreshing a stale path if one exists.
-    #
-    # The earlier check matched on the substring "claude-session-track" and
-    # skipped install if any hook contained it. That left STALE paths in
-    # place across reinstalls — e.g. on Nix/NixOS, where each rebuild can
-    # produce a new /nix/store hash for the plugin and the previous
-    # derivation gets garbage-collected. Claude Code then ran a hook
-    # pointing at a path that no longer existed and emitted
-    # "SessionStart:clear hook error / bash: <gone-path>: No such file".
-    #
-    # New idempotency: skip only when the EXACT current command (path-
-    # matched) is already installed. Otherwise filter out any prior
-    # instance of this hook (any path) and add the current one. Each
-    # tmux start now self-heals stale entries left by a previous install.
-    if ! jq -e --arg cmd "$track_cmd" '.hooks.SessionStart[]?.hooks[]? | select((.command // "") == $cmd)' "$settings" >/dev/null 2>&1; then
+    # Install SessionStart hook, refreshing stale paths if any exist.
+    # Skip only when the current command is present AND no stale copies remain.
+    local has_current_track has_stale_track
+    has_current_track=$(jq --arg cmd "$track_cmd" '[.hooks.SessionStart[]?.hooks[]? | select((.command // "") == $cmd)] | length' "$settings" 2>/dev/null || echo 0)
+    has_stale_track=$(jq --arg cmd "$track_cmd" '[.hooks.SessionStart[]?.hooks[]? | select(((.command // "") | contains("claude-session-track")) and ((.command // "") != $cmd))] | length' "$settings" 2>/dev/null || echo 0)
+    if [ "$has_current_track" = "0" ] || [ "$has_stale_track" != "0" ]; then
         local tmp
         tmp=$(mktemp)
         jq --arg cmd "$track_cmd" '
@@ -84,7 +75,10 @@ install_claude_hooks() {
     fi
 
     # Install SessionEnd hook (same self-healing pattern as SessionStart).
-    if ! jq -e --arg cmd "$cleanup_cmd" '.hooks.SessionEnd[]?.hooks[]? | select((.command // "") == $cmd)' "$settings" >/dev/null 2>&1; then
+    local has_current_cleanup has_stale_cleanup
+    has_current_cleanup=$(jq --arg cmd "$cleanup_cmd" '[.hooks.SessionEnd[]?.hooks[]? | select((.command // "") == $cmd)] | length' "$settings" 2>/dev/null || echo 0)
+    has_stale_cleanup=$(jq --arg cmd "$cleanup_cmd" '[.hooks.SessionEnd[]?.hooks[]? | select(((.command // "") | contains("claude-session-cleanup")) and ((.command // "") != $cmd))] | length' "$settings" 2>/dev/null || echo 0)
+    if [ "$has_current_cleanup" = "0" ] || [ "$has_stale_cleanup" != "0" ]; then
         local tmp
         tmp=$(mktemp)
         jq --arg cmd "$cleanup_cmd" '

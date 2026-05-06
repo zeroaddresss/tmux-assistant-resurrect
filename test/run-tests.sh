@@ -2040,6 +2040,57 @@ assert_eq "Null hooks: exactly 1 track hook installed" "1" "$null_track"
 null_end=$(jq '[.hooks.SessionEnd[]?.hooks[]? | select((.command // "") | contains("claude-session-cleanup"))] | length' "$HOME/.claude/settings.json")
 assert_eq "Null hooks: exactly 1 cleanup hook installed" "1" "$null_end"
 
+# --- Test 7h: Current + stale hook coexist (cleanup must still run) ---
+#
+# If both the current-path hook AND a stale-path duplicate are present
+# (e.g. from manual editing or corruption), the cleanup block must still
+# fire to remove the stale copy. Previously the exact-match guard would
+# see the current hook, skip the block, and leave the stale duplicate.
+
+echo ""
+echo "=== Test 7h: Current + stale hook coexist ==="
+echo ""
+
+rm -f "$HOME/.claude/settings.json"
+echo '{}' >"$HOME/.claude/settings.json"
+
+# Inject both the CURRENT path and a STALE path for SessionStart and SessionEnd
+current_track="bash '${REPO_DIR}/hooks/claude-session-track.sh'"
+current_cleanup="bash '${REPO_DIR}/hooks/claude-session-cleanup.sh'"
+tmp_dual=$(mktemp)
+jq --arg cur_track "$current_track" --arg stale_track "$stale_track" \
+   --arg cur_cleanup "$current_cleanup" --arg stale_cleanup "$stale_cleanup" '
+    .hooks = {
+        "SessionStart": [
+            {"matcher": "", "hooks": [{"type": "command", "command": $cur_track}]},
+            {"matcher": "", "hooks": [{"type": "command", "command": $stale_track}]}
+        ],
+        "SessionEnd": [
+            {"matcher": "", "hooks": [{"type": "command", "command": $cur_cleanup}]},
+            {"matcher": "", "hooks": [{"type": "command", "command": $stale_cleanup}]}
+        ]
+    }
+' "$HOME/.claude/settings.json" >"$tmp_dual" && mv "$tmp_dual" "$HOME/.claude/settings.json"
+
+# Verify both are in place
+dual_before=$(jq '[.hooks.SessionStart[]?.hooks[]? | select(.command | contains("claude-session-track"))] | length' "$HOME/.claude/settings.json")
+assert_eq "Dual: 2 track hooks present before cleanup" "2" "$dual_before"
+
+# Run the plugin — must remove the stale copy, keep exactly 1
+bash "$REPO_DIR/tmux-assistant-resurrect.tmux"
+
+dual_after=$(jq '[.hooks.SessionStart[]?.hooks[]? | select(.command | contains("claude-session-track"))] | length' "$HOME/.claude/settings.json")
+assert_eq "Dual: exactly 1 SessionStart hook after cleanup" "1" "$dual_after"
+
+dual_cmd=$(jq -r '.hooks.SessionStart[]?.hooks[]? | select(.command | contains("claude-session-track")) | .command' "$HOME/.claude/settings.json")
+assert_eq "Dual: surviving hook has current path" "$current_track" "$dual_cmd"
+
+dual_end_after=$(jq '[.hooks.SessionEnd[]?.hooks[]? | select(.command | contains("claude-session-cleanup"))] | length' "$HOME/.claude/settings.json")
+assert_eq "Dual: exactly 1 SessionEnd hook after cleanup" "1" "$dual_end_after"
+
+dual_end_cmd=$(jq -r '.hooks.SessionEnd[]?.hooks[]? | select(.command | contains("claude-session-cleanup")) | .command' "$HOME/.claude/settings.json")
+assert_eq "Dual: surviving SessionEnd hook has current path" "$current_cleanup" "$dual_end_cmd"
+
 # --- Test 8: strip_assistant_pane_contents() ---
 
 suite "strip_pane_contents"
