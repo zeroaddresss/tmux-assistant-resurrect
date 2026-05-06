@@ -74,10 +74,14 @@ process args as a reliable fallback.
 - Log files go to `~/.tmux/resurrect/assistant-{save,restore}.log` (truncated to 500 lines per run)
 - Process inspection uses `ps -eo pid=,ppid=` (not `pgrep -P` -- unreliable on macOS)
 - Agent detection matches binary names via `case` patterns in `detect_tool()`
-- Hook matching in jq uses `(.command // "") | contains("claude-session-track")`
-  (not exact `==`) to tolerate quoting changes across versions and ensure backward
-  compatibility. The `// ""` null-coalescing prevents crashes on hook entries that
-  lack a `.command` field (e.g., URL-type hooks added by other tools)
+- Hook install uses two-phase matching: **exact equality** (`== $cmd`) to detect
+  whether the current-path hook is already installed, and **substring match**
+  (`contains("claude-session-track")`) to clean up stale copies left by path
+  changes (e.g., Nix rebuilds). Cleanup runs when the current hook is missing OR
+  stale copies exist. The `// ""` null-coalescing on `.command` prevents crashes
+  on hook entries that lack a `.command` field (e.g., URL-type hooks), and
+  `.hooks` is null-coalesced before mapping to handle entries with missing/null
+  hooks arrays
 - Use `posix_quote()` from `lib-detect.sh` for any values sent to tmux panes
   via `send-keys` (safe for bash, zsh, fish, and other POSIX-ish shells)
 - Hook command paths use single quotes (`bash '${CURRENT_DIR}/hooks/...'`);

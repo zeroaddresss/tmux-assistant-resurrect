@@ -50,15 +50,23 @@ install_claude_hooks() {
         return
     fi
 
-    # Install SessionStart hook if not present.
-    # Use contains() for matching — tolerates quoting changes across versions
-    # (e.g., upgrading from unquoted to quoted paths won't create duplicates).
-    if ! jq -e '.hooks.SessionStart[]?.hooks[]? | select((.command // "") | contains("claude-session-track"))' "$settings" >/dev/null 2>&1; then
+    # Install SessionStart hook, refreshing stale paths if any exist.
+    # Skip only when the current command is present AND no stale copies remain.
+    local has_current_track has_stale_track
+    has_current_track=$(jq --arg cmd "$track_cmd" '[.hooks.SessionStart[]?.hooks[]? | select((.command // "") == $cmd)] | length' "$settings" 2>/dev/null || echo 0)
+    has_stale_track=$(jq --arg cmd "$track_cmd" '[.hooks.SessionStart[]?.hooks[]? | select(((.command // "") | contains("claude-session-track")) and ((.command // "") != $cmd))] | length' "$settings" 2>/dev/null || echo 0)
+    if [ "$has_current_track" = "0" ] || [ "$has_stale_track" != "0" ]; then
         local tmp
         tmp=$(mktemp)
         jq --arg cmd "$track_cmd" '
             .hooks //= {} |
             .hooks.SessionStart //= [] |
+            # Drop any prior instance of this hook (different paths included).
+            .hooks.SessionStart |= map(
+                .hooks = ((.hooks // []) | map(select((.command // "") | contains("claude-session-track") | not)))
+            ) |
+            # Drop entries whose hooks list became empty after the filter.
+            .hooks.SessionStart |= map(select((.hooks // []) | length > 0)) |
             .hooks.SessionStart += [{
                 "matcher": "",
                 "hooks": [{"type": "command", "command": $cmd}]
@@ -66,13 +74,20 @@ install_claude_hooks() {
         ' "$settings" > "$tmp" && mv "$tmp" "$settings"
     fi
 
-    # Install SessionEnd hook if not present
-    if ! jq -e '.hooks.SessionEnd[]?.hooks[]? | select((.command // "") | contains("claude-session-cleanup"))' "$settings" >/dev/null 2>&1; then
+    # Install SessionEnd hook (same self-healing pattern as SessionStart).
+    local has_current_cleanup has_stale_cleanup
+    has_current_cleanup=$(jq --arg cmd "$cleanup_cmd" '[.hooks.SessionEnd[]?.hooks[]? | select((.command // "") == $cmd)] | length' "$settings" 2>/dev/null || echo 0)
+    has_stale_cleanup=$(jq --arg cmd "$cleanup_cmd" '[.hooks.SessionEnd[]?.hooks[]? | select(((.command // "") | contains("claude-session-cleanup")) and ((.command // "") != $cmd))] | length' "$settings" 2>/dev/null || echo 0)
+    if [ "$has_current_cleanup" = "0" ] || [ "$has_stale_cleanup" != "0" ]; then
         local tmp
         tmp=$(mktemp)
         jq --arg cmd "$cleanup_cmd" '
             .hooks //= {} |
             .hooks.SessionEnd //= [] |
+            .hooks.SessionEnd |= map(
+                .hooks = ((.hooks // []) | map(select((.command // "") | contains("claude-session-cleanup") | not)))
+            ) |
+            .hooks.SessionEnd |= map(select((.hooks // []) | length > 0)) |
             .hooks.SessionEnd += [{
                 "matcher": "",
                 "hooks": [{"type": "command", "command": $cmd}]
