@@ -2604,6 +2604,61 @@ fi
 tmux set-option -gu @assistant-resurrect-capture-env 2>/dev/null || true
 kill_pane_children test-restore-envfilter true
 
+# --- Test 10e2: Restore rejects invalid env var names ---
+
+echo ""
+echo "=== Test 10e2: restore rejects invalid env var names ==="
+echo ""
+
+tmux new-session -d -s test-restore-badvar -c /tmp 2>/dev/null || true
+sleep 0.5
+
+cat >"$HOME/.tmux/resurrect/assistant-sessions.json" <<'BADVAREOF'
+{
+  "timestamp": "2026-01-01T00:00:00Z",
+  "sessions": [
+    {
+      "pane": "test-restore-badvar:0.0",
+      "tool": "claude",
+      "session_id": "ses_badvar",
+      "cwd": "/tmp",
+      "cli_args": "",
+      "env": {"GOOD_VAR": "safe", "BAD$(cmd)": "evil", "123NUM": "wrong", "OK_2": "fine"}
+    }
+  ]
+}
+BADVAREOF
+
+# Set capture-env to include both valid and invalid names
+tmux set-option -g @assistant-resurrect-capture-env 'GOOD_VAR BAD$(cmd) 123NUM OK_2' 2>/dev/null || true
+
+RESTORE_LOG="$HOME/.tmux/resurrect/assistant-restore.log"
+rm -f "$RESTORE_LOG"
+"${TEST_BASH:-bash}" "$REPO_DIR/scripts/restore-assistant-sessions.sh" 2>/dev/null || true
+
+badvar_log=$(cat "$RESTORE_LOG")
+
+# Valid names should be in the command
+assert_contains "Env var validation: GOOD_VAR accepted" "$badvar_log" "GOOD_VAR="
+assert_contains "Env var validation: OK_2 accepted" "$badvar_log" "OK_2="
+
+# Invalid names should be rejected
+if echo "$badvar_log" | grep -q 'BAD\$'; then
+	# Check it was skipped, not used in the command
+	assert_contains "Env var validation: BAD\$(cmd) skipped" "$badvar_log" "skipping invalid env var name"
+else
+	pass "Env var validation: BAD\$(cmd) not in output at all"
+fi
+
+if echo "$badvar_log" | grep -q '123NUM='; then
+	fail "Env var validation: 123NUM should be rejected (starts with digit)"
+else
+	pass "Env var validation: 123NUM rejected"
+fi
+
+tmux set-option -gu @assistant-resurrect-capture-env 2>/dev/null || true
+kill_pane_children test-restore-badvar true
+
 # --- Test 10f: Restore quotes cli_args containing shell-special chars (e.g., []) ---
 
 suite "restore_special_chars"

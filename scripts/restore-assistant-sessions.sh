@@ -135,6 +135,11 @@ while read -r entry; do
 	if [ -n "$env_json" ] && [ "$env_json" != "null" ] && [ "$env_json" != "{}" ]; then
 		capture_env=$(tmux show-option -gqv @assistant-resurrect-capture-env 2>/dev/null || true)
 		for var in $capture_env; do
+			# Validate var name to prevent shell injection via crafted tmux option
+			if ! [[ "$var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+				log "skipping invalid env var name: $var"
+				continue
+			fi
 			val=$(echo "$env_json" | jq -r --arg k "$var" '.[$k] // empty')
 			if [ -n "$val" ]; then
 				env_prefix="${env_prefix}${var}=$(posix_quote "$val") "
