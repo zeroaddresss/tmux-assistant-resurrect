@@ -2357,6 +2357,18 @@ assert_eq "Codex strip fork" "--full-auto" \
 assert_eq "Codex bare fork" "--full-auto" \
 	"$(extract_cli_args "codex" "codex --full-auto fork")"
 
+# Codex: resume --last (subcommand picker flag stripped)
+assert_eq "Codex resume --last" "" \
+	"$(extract_cli_args "codex" "codex resume --last")"
+
+# Codex: fork --last with other flags
+assert_eq "Codex fork --last" "--full-auto" \
+	"$(extract_cli_args "codex" "codex --full-auto fork --last")"
+
+# Codex: resume --all --include-non-interactive
+assert_eq "Codex resume --all --include-non-interactive" "" \
+	"$(extract_cli_args "codex" "codex resume --all --include-non-interactive")"
+
 # --- Test 9c: dynamic discovery sanity check ---
 # Verifies _discover_session_flags actually finds flags from --help.
 # Catches regressions in the help-parsing logic itself.

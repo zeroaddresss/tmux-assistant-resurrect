@@ -370,6 +370,11 @@ _strip_short_opt() {
 	echo "$2" | sed -E "s/(^| )$1( +[^- ][^ ]*)?( |$)/ /g"
 }
 
+# Strip a boolean long option (no value): --flag
+_strip_bool_opt() {
+	echo "$2" | sed -E "s/(^| )$1( |$)/ /g"
+}
+
 # Strip a positional subcommand + optional value: cmd [val]
 _strip_subcmd() {
 	echo "$2" | sed -E "s/(^| )$1( +[^- ][^ ]*)?( |$)/ /g"
@@ -391,7 +396,13 @@ _discover_session_flags() {
 	local help_out result=""
 	help_out=$("$tool" --help 2>/dev/null) || true
 	if [ -z "$help_out" ]; then
-		printf -v "$cache_var" '%s' "-"
+		# Fallback: tmux hooks may run with a limited PATH that cannot
+		# resolve the binary even though the process is running. Use a
+		# static set so known session flags are still stripped.
+		local fallback_var="SESSION_FLAGS_FALLBACK_${tool}"
+		local fallback="${!fallback_var:-}"
+		printf -v "$cache_var" '%s' "${fallback:--}"
+		[ -n "$fallback" ] && echo "$fallback"
 		return
 	fi
 
@@ -417,6 +428,18 @@ SESSION_FLAG_PATTERN_claude='^--(resume|continue|session-id|fork-session|from-pr
 SESSION_FLAG_PATTERN_opencode='^--session$'
 # codex uses subcommands (resume, fork), not --flags — handled separately.
 SESSION_SUBCMD_PATTERN_codex='resume|fork'
+# Codex resume/fork have subcommand-specific picker flags that must also
+# be stripped (they are not top-level options and break restore if kept).
+SESSION_SUBCMD_FLAGS_codex='--last --all --include-non-interactive'
+
+# Static fallbacks for when <tool> --help is unavailable (tmux hooks may
+# run with a limited PATH that cannot resolve the binary).
+SESSION_FLAGS_FALLBACK_claude="--continue -c
+--fork-session
+--from-pr
+--resume -r
+--session-id"
+SESSION_FLAGS_FALLBACK_opencode="--session -s"
 
 # --- CLI args extraction ---
 
@@ -472,14 +495,23 @@ extract_cli_args() {
 	fi
 
 	if [ -n "$subcmd_pattern" ]; then
-		local subcmd
-		local help_out
+		local subcmd help_out matched=0
 		help_out=$("$tool" --help 2>/dev/null) || true
 		for subcmd in $(echo "$subcmd_pattern" | tr '|' ' '); do
-			if [ -n "$help_out" ] && echo "$help_out" | grep -qw "$subcmd"; then
+			if [ -z "$help_out" ] || echo "$help_out" | grep -qw "$subcmd"; then
 				args=$(_strip_subcmd "$subcmd" "$args")
+				matched=1
 			fi
 		done
+		# Strip subcommand-specific picker flags (e.g. codex resume --last)
+		if [ "$matched" = "1" ]; then
+			local subcmd_flags_var="SESSION_SUBCMD_FLAGS_${tool}"
+			local subcmd_flags="${!subcmd_flags_var:-}"
+			local flag
+			for flag in $subcmd_flags; do
+				args=$(_strip_bool_opt "$flag" "$args")
+			done
+		fi
 	fi
 
 	# Normalize whitespace: collapse multiple spaces, trim leading/trailing
