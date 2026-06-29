@@ -7,7 +7,7 @@ classification or screen content analysis. The save script:
 
 1. Takes a single `ps -eo pid=,ppid=,args=` snapshot (efficient, no per-pane calls)
 2. For each tmux pane, finds direct child processes of the pane's shell
-3. Matches binary names via `case` patterns (`*/claude`, `*/opencode`, `*/codex`, `*/pi`)
+3. Matches binary names via `case` patterns (`*/claude`, `*/opencode`, `*/codex`, `*/pi`, `*/omp`)
 4. Excludes known false positives (e.g., `opencode run ...` LSP subprocesses)
 
 This is simple, fast, and deterministic. No API calls, no LLM costs, no
@@ -40,6 +40,10 @@ before hooks/plugins have fired):
   `resume <id>` in process args (fallback)
 - **Pi**: `--session <id>` in process args (fallback); session header lookup in
   `~/.pi/agent/sessions/--<cwd>--/*.jsonl` (primary for fresh sessions)
+- **Oh My Pi**: `--resume <id>` / `-r <id>` in process args (fallback);
+  terminal breadcrumb lookup under `$XDG_STATE_HOME/omp` plus session JSONL
+  lookup under `$XDG_DATA_HOME/omp` or `~/.omp/agent/sessions` (primary for
+  fresh sessions, with `--profile` and `--session-dir` support)
 
 ## Adding a new assistant
 
@@ -65,6 +69,9 @@ To add support for a new tool:
 - **Pi** stores sessions as JSONL files under `~/.pi/agent/sessions` keyed by
   encoded cwd. Session IDs are in the header line (`type: "session"`, `id`).
   Process args remain a useful fallback when launched with `--session`.
+- **Oh My Pi** stores terminal breadcrumbs and JSONL session files under XDG
+  directories when present, falling back to `~/.omp`. Session IDs are in the
+  JSONL header; process args remain useful after restore via `--resume` / `-r`.
 
 ## macOS considerations
 

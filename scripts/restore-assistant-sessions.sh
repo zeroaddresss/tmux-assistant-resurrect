@@ -206,6 +206,13 @@ while read -r entry; do
 			resume_cmd="command pi --session ${safe_sid}"
 		fi
 		;;
+	omp)
+		if [ -n "$safe_cli_args" ]; then
+			resume_cmd="command omp${safe_cli_args} --resume ${safe_sid}"
+		else
+			resume_cmd="command omp --resume ${safe_sid}"
+		fi
+		;;
 	*)
 		log "unknown tool '$tool' for pane $pane, skipping"
 		continue

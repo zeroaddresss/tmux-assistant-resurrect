@@ -57,6 +57,7 @@ log() {
 
 USED_CODEX_SESSION_IDS=""
 USED_PI_SESSION_IDS=""
+USED_OMP_SESSION_IDS=""
 
 # --- Session ID extraction ---
 
@@ -350,48 +351,117 @@ PY
 	fi
 }
 
-get_pi_session() {
+_arg_value() {
+	local args="$1"
+	shift
+	local -a words=($args)
+	local i n word flag next
+	n=${#words[@]}
+	for ((i = 0; i < n; i++)); do
+		word="${words[$i]}"
+		for flag in "$@"; do
+			case "$word" in
+			"$flag="*)
+				echo "${word#*=}"
+				return
+				;;
+			"$flag")
+				next=$((i + 1))
+				if [ "$next" -lt "$n" ]; then
+					case "${words[$next]}" in
+					-*) ;;
+					*)
+						echo "${words[$next]}"
+						return
+						;;
+					esac
+				fi
+				;;
+			esac
+		done
+	done
+	return 0
+}
+
+resolve_path_against() {
+	local base="$1"
+	local path="$2"
+	case "$path" in
+	/*)
+		echo "$path"
+		;;
+	*)
+		if command -v python3 >/dev/null 2>&1; then
+			python3 - "$base" "$path" <<'PY'
+import os, sys
+print(os.path.abspath(os.path.join(sys.argv[1], sys.argv[2])))
+PY
+		else
+			echo "${base%/}/$path"
+		fi
+		;;
+	esac
+}
+
+jsonl_session_id_from_file() {
+	local session_file="$1"
+	[ -f "$session_file" ] || return 0
+	command -v python3 >/dev/null 2>&1 || return 0
+	python3 - "$session_file" <<'PY'
+import json, sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as f:
+        first = f.readline()
+        second = f.readline()
+except Exception:
+    sys.exit(0)
+
+for raw in (first, second if first else ""):
+    if not raw:
+        continue
+    try:
+        header = json.loads(raw)
+    except Exception:
+        continue
+    if header.get("type") == "title":
+        continue
+    if header.get("type") != "session":
+        sys.exit(0)
+    sid = header.get("id")
+    if isinstance(sid, str) and sid:
+        print(sid)
+    sys.exit(0)
+PY
+}
+
+select_jsonl_session_id() {
 	local child_pid="$1"
-	local args="$2"
-	local cwd="${3:-}"
+	local cwd="$2"
+	local used_ids="$3"
+	shift 3
+	[ -n "$cwd" ] || return 0
+	[ "$#" -gt 0 ] || return 0
+	command -v python3 >/dev/null 2>&1 || return 0
 
-	# Method 1: --session flag in process args (chicken-and-egg fallback)
-	# After restore, pi is launched as `pi --session <session_id>`.
-	# Supports both `--session <id>` and `--session=<id>` forms.
-	local sid
-	sid=$(echo "$args" | sed -n 's/.*--session[= ] *\([A-Za-z0-9_-]*\).*/\1/p')
-	if [ -n "$sid" ]; then
-		echo "$sid"
-		return
-	fi
-
-	# Method 2: session files under ~/.pi/agent/sessions/--<cwd>--.
-	# pi stores one JSONL file per session and writes a header line with
-	# {type:"session", id:"...", cwd:"...", timestamp:"..."}.
-	#
-	# Strategy: among sessions for this cwd, prefer IDs not already assigned
-	# in this save run, prefer files touched during this process lifetime,
-	# then prefer header timestamps closest to process start.
-	#
-	# Limitation: this is not PID-specific. If multiple pi processes run in the
-	# same cwd and all session files are equally plausible, one pane may map to
-	# the wrong session. We minimize this via dedup + process-time scoring.
-	local sessions_root="${PI_CODING_AGENT_SESSION_DIR:-${HOME}/.pi/agent/sessions}"
-	if [ -n "$cwd" ] && [ -d "$sessions_root" ] && command -v python3 >/dev/null 2>&1; then
-		local safe_cwd
-		safe_cwd=$(echo "$cwd" | sed -e 's#^[\\/]*##' -e 's#[/\\:]#-#g')
-		local session_dir="${sessions_root}/--${safe_cwd}--"
-		if [ -d "$session_dir" ]; then
-			local etimes
-			etimes=$(ps -o etimes= -p "$child_pid" 2>/dev/null | tr -d ' ' || true)
-			sid=$(
-				USED_PI_SESSION_IDS="$USED_PI_SESSION_IDS" python3 - "$session_dir" "$cwd" "$etimes" <<'PY'
+	local etimes
+	etimes=$(ps -o etimes= -p "$child_pid" 2>/dev/null | tr -d ' ' || true)
+	python3 - "$cwd" "$etimes" "$used_ids" "$@" <<'PY'
 import datetime, glob, json, os, sys, time
 
-session_dir = sys.argv[1]
-cwd = sys.argv[2]
-etimes_raw = sys.argv[3].strip()
-used = {sid for sid in os.environ.get("USED_PI_SESSION_IDS", "").split("\t") if sid}
+cwd = sys.argv[1]
+etimes_raw = sys.argv[2].strip()
+used = {sid for sid in sys.argv[3].split("\t") if sid}
+session_dirs = []
+seen_dirs = set()
+for session_dir in sys.argv[4:]:
+    if not session_dir or not os.path.isdir(session_dir):
+        continue
+    key = os.path.abspath(session_dir)
+    if key in seen_dirs:
+        continue
+    seen_dirs.add(key)
+    session_dirs.append(session_dir)
 
 process_start = None
 if etimes_raw.isdigit():
@@ -405,25 +475,35 @@ def parse_ts(value):
     except Exception:
         return None
 
+def read_logical_header(path):
+    with open(path, "r", encoding="utf-8") as f:
+        first = f.readline()
+        second = f.readline()
+    for raw in (first, second if first else ""):
+        if not raw:
+            continue
+        header = json.loads(raw)
+        if header.get("type") == "title":
+            continue
+        return header
+    return None
+
 candidates = []
-for path in glob.glob(os.path.join(session_dir, "*.jsonl")):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            first = f.readline()
-        if not first:
+for session_dir in session_dirs:
+    for path in glob.glob(os.path.join(session_dir, "*.jsonl")):
+        try:
+            header = read_logical_header(path)
+            if not header or header.get("type") != "session":
+                continue
+            sid = header.get("id")
+            if not sid:
+                continue
+            header_cwd = header.get("cwd")
+            if isinstance(header_cwd, str) and header_cwd and header_cwd != cwd:
+                continue
+            candidates.append((sid, parse_ts(header.get("timestamp")), os.path.getmtime(path)))
+        except Exception:
             continue
-        header = json.loads(first)
-        if header.get("type") != "session":
-            continue
-        sid = header.get("id")
-        if not sid:
-            continue
-        header_cwd = header.get("cwd")
-        if isinstance(header_cwd, str) and header_cwd and header_cwd != cwd:
-            continue
-        candidates.append((sid, parse_ts(header.get("timestamp")), os.path.getmtime(path)))
-    except Exception:
-        continue
 
 if not candidates:
     sys.exit(0)
@@ -450,12 +530,208 @@ def score(item):
 best = max(candidates, key=score)
 print(best[0])
 PY
-			)
-			if [ -n "$sid" ]; then
-				echo "$sid"
-				return
-			fi
+}
+
+get_pi_session() {
+	local child_pid="$1"
+	local args="$2"
+	local cwd="${3:-}"
+
+	# Method 1: --session flag in process args (chicken-and-egg fallback)
+	# After restore, pi is launched as `pi --session <session_id>`.
+	# Supports both `--session <id>` and `--session=<id>` forms.
+	local sid
+	sid=$(echo "$args" | sed -n 's/.*--session[= ] *\([A-Za-z0-9_-]*\).*/\1/p')
+	if [ -n "$sid" ]; then
+		echo "$sid"
+		return
+	fi
+
+	# Method 2: session files under ~/.pi/agent/sessions/--<cwd>--.
+	# Pi writes one JSONL file per session with a session header. The shared
+	# selector keeps the existing process-time scoring and same-cwd dedup policy.
+	local sessions_root="${PI_CODING_AGENT_SESSION_DIR:-${HOME}/.pi/agent/sessions}"
+	if [ -n "$cwd" ] && [ -d "$sessions_root" ]; then
+		local safe_cwd session_dir
+		safe_cwd=$(echo "$cwd" | sed -e 's#^[\\/]*##' -e 's#[/\\:]#-#g')
+		session_dir="${sessions_root}/--${safe_cwd}--"
+		sid=$(select_jsonl_session_id "$child_pid" "$cwd" "$USED_PI_SESSION_IDS" "$session_dir")
+		if [ -n "$sid" ]; then
+			echo "$sid"
+			return
 		fi
+	fi
+}
+
+omp_config_root() {
+	echo "${PI_CONFIG_DIR:-${HOME}/.omp}"
+}
+
+omp_agent_dir() {
+	local profile="$1"
+	local config_root
+	config_root=$(omp_config_root)
+	if [ -n "$profile" ]; then
+		echo "${config_root}/profiles/${profile}/agent"
+	elif [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
+		echo "$PI_CODING_AGENT_DIR"
+	else
+		echo "${config_root}/agent"
+	fi
+}
+
+omp_session_root() {
+	local profile="$1"
+	local xdg_data_home="${XDG_DATA_HOME:-${HOME}/.local/share}"
+	local config_root
+	config_root=$(omp_config_root)
+	if [ -n "$profile" ]; then
+		if [ -d "${xdg_data_home}/omp/profiles/${profile}" ]; then
+			echo "${xdg_data_home}/omp/profiles/${profile}/sessions"
+		else
+			echo "${config_root}/profiles/${profile}/agent/sessions"
+		fi
+	elif [ -d "${xdg_data_home}/omp" ]; then
+		echo "${xdg_data_home}/omp/sessions"
+	elif [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
+		echo "${PI_CODING_AGENT_DIR}/sessions"
+	else
+		echo "${config_root}/agent/sessions"
+	fi
+}
+
+omp_terminal_session_root() {
+	local profile="$1"
+	local xdg_state_home="${XDG_STATE_HOME:-${HOME}/.local/state}"
+	if [ -n "$profile" ]; then
+		if [ -d "${xdg_state_home}/omp/profiles/${profile}" ]; then
+			echo "${xdg_state_home}/omp/profiles/${profile}/terminal-sessions"
+		else
+			echo "$(omp_agent_dir "$profile")/terminal-sessions"
+		fi
+	elif [ -d "${xdg_state_home}/omp" ]; then
+		echo "${xdg_state_home}/omp/terminal-sessions"
+	else
+		echo "$(omp_agent_dir "")/terminal-sessions"
+	fi
+}
+
+omp_terminal_id_from_tty() {
+	local pane_tty="$1"
+	pane_tty="${pane_tty#/dev/}"
+	echo "$pane_tty" | sed -e 's#[/\\:]#-#g'
+}
+
+omp_sanitize_path_name() {
+	echo "$1" | sed -e 's#[/\\:]#-#g'
+}
+
+omp_session_dir_names() {
+	local cwd="$1"
+	local home="${HOME%/}"
+	local tmp="${TMPDIR:-/tmp}"
+	tmp="${tmp%/}"
+	local primary rel legacy
+	case "$cwd" in
+	"$home")
+		primary="-"
+		;;
+	"$home"/*)
+		rel="${cwd#"$home"/}"
+		primary="-$(omp_sanitize_path_name "$rel")"
+		;;
+	"$tmp")
+		primary="-tmp"
+		;;
+	"$tmp"/*)
+		rel="${cwd#"$tmp"/}"
+		primary="-tmp-$(omp_sanitize_path_name "$rel")"
+		;;
+	*)
+		primary="--$(echo "$cwd" | sed -e 's#^[\\/]*##' -e 's#[/\\:]#-#g')--"
+		;;
+	esac
+	legacy="--$(echo "$cwd" | sed -e 's#^[\\/]*##' -e 's#[/\\:]#-#g')--"
+	echo "$primary"
+	[ "$legacy" != "$primary" ] && echo "$legacy"
+}
+
+get_omp_breadcrumb_session() {
+	local pane_tty="$1"
+	local lookup_cwd="$2"
+	local profile="$3"
+	[ -n "$pane_tty" ] || return 0
+	[ -n "$lookup_cwd" ] || return 0
+
+	local terminal_id root breadcrumb recorded_cwd session_file sid
+	terminal_id=$(omp_terminal_id_from_tty "$pane_tty")
+	[ -n "$terminal_id" ] || return 0
+	root=$(omp_terminal_session_root "$profile")
+	breadcrumb="${root}/${terminal_id}"
+	[ -f "$breadcrumb" ] || return 0
+
+	{
+		IFS= read -r recorded_cwd || true
+		IFS= read -r session_file || true
+	} <"$breadcrumb"
+	[ "$recorded_cwd" = "$lookup_cwd" ] || return 0
+	[ -f "$session_file" ] || return 0
+
+	sid=$(jsonl_session_id_from_file "$session_file")
+	if [ -n "$sid" ]; then
+		echo "$sid"
+	fi
+}
+
+get_omp_session() {
+	local child_pid="$1"
+	local args="$2"
+	local pane_cwd="${3:-}"
+	local pane_tty="${4:-}"
+
+	local sid
+	sid=$(_arg_value "$args" --resume -r --session)
+	if [ -n "$sid" ]; then
+		echo "$sid"
+		return
+	fi
+
+	local lookup_cwd="$pane_cwd"
+	local cwd_arg
+	cwd_arg=$(_arg_value "$args" --cwd)
+	if [ -n "$cwd_arg" ]; then
+		lookup_cwd=$(resolve_path_against "$pane_cwd" "$cwd_arg")
+	fi
+
+	local profile
+	profile=$(_arg_value "$args" --profile)
+
+	sid=$(get_omp_breadcrumb_session "$pane_tty" "$lookup_cwd" "$profile")
+	if [ -n "$sid" ]; then
+		echo "$sid"
+		return
+	fi
+
+	local custom_session_dir
+	custom_session_dir=$(_arg_value "$args" --session-dir)
+	if [ -n "$custom_session_dir" ]; then
+		custom_session_dir=$(resolve_path_against "$lookup_cwd" "$custom_session_dir")
+		sid=$(select_jsonl_session_id "$child_pid" "$lookup_cwd" "$USED_OMP_SESSION_IDS" "$custom_session_dir")
+		if [ -n "$sid" ]; then
+			echo "$sid"
+			return
+		fi
+	fi
+
+	local session_root dir_name
+	local -a session_dirs=()
+	session_root=$(omp_session_root "$profile")
+	while IFS= read -r dir_name; do
+		[ -n "$dir_name" ] && session_dirs+=("${session_root}/${dir_name}")
+	done <<<"$(omp_session_dir_names "$lookup_cwd")"
+	sid=$(select_jsonl_session_id "$child_pid" "$lookup_cwd" "$USED_OMP_SESSION_IDS" "${session_dirs[@]}")
+	if [ -n "$sid" ]; then
+		echo "$sid"
 	fi
 }
 
@@ -477,6 +753,17 @@ register_pi_session_id() {
 	*"$sid"*) ;;
 	*)
 		USED_PI_SESSION_IDS="${USED_PI_SESSION_IDS}"$'\t'"$sid"
+		;;
+	esac
+}
+
+register_omp_session_id() {
+	local sid="$1"
+	[ -z "$sid" ] && return
+	case "$USED_OMP_SESSION_IDS" in
+	*"$sid"*) ;;
+	*)
+		USED_OMP_SESSION_IDS="${USED_OMP_SESSION_IDS}"$'\t'"$sid"
 		;;
 	esac
 }
@@ -535,7 +822,8 @@ _strip_subcmds() {
 			;;
 		esac
 	done
-	echo "${words[*]}"
+	[ "${#words[@]}" -gt 0 ] && echo "${words[*]}"
+	return 0
 }
 
 # Discover session-identity flags from a tool's --help output.
@@ -552,31 +840,29 @@ _discover_session_flags() {
 	fi
 
 	local help_out result=""
+	local fallback_var="SESSION_FLAGS_FALLBACK_${tool}"
+	local fallback="${!fallback_var:-}"
 	help_out=$("$tool" --help 2>/dev/null) || true
-	if [ -z "$help_out" ]; then
-		# Fallback: tmux hooks may run with a limited PATH that cannot
-		# resolve the binary even though the process is running. Use a
-		# static set so known session flags are still stripped.
-		local fallback_var="SESSION_FLAGS_FALLBACK_${tool}"
-		local fallback="${!fallback_var:-}"
-		printf -v "$cache_var" '%s' "${fallback:--}"
-		[ -n "$fallback" ] && echo "$fallback"
-		return
+	if [ -n "$help_out" ]; then
+		local line long short
+		while IFS= read -r line; do
+			long=$(echo "$line" | grep -oE -- '--[a-z][-a-z]*' | head -1) || continue
+			echo "$long" | grep -qE "$pattern" || continue
+			# Extract short flag: handles both "-X, --long" and "--long, -X" formats
+			short=$(echo "$line" | grep -oE '(^|\s|,\s*)-[a-zA-Z](\s|,|$)' | grep -oE '\-[a-zA-Z]' | head -1 || true)
+			result="${result}${long}${short:+ ${short}}
+"
+		done <<<"$(echo "$help_out" | grep -E '^\s+(-[a-zA-Z],\s+)?--')"
 	fi
 
-	local line long short
-	while IFS= read -r line; do
-		long=$(echo "$line" | grep -oE -- '--[a-z][-a-z]*' | head -1) || continue
-		echo "$long" | grep -qE "$pattern" || continue
-		# Extract short flag: handles both "-X, --long" and "--long, -X" formats
-		short=$(echo "$line" | grep -oE '(^|\s|,\s*)-[a-zA-Z](\s|,|$)' | grep -oE '\-[a-zA-Z]' | head -1 || true)
-		result="${result}${long}${short:+ ${short}}
+	if [ -n "$fallback" ]; then
+		result="${result}${fallback}
 "
-	done <<< "$(echo "$help_out" | grep -E '^\s+(-[a-zA-Z],\s+)?--')"
-
+	fi
 	result=$(echo "$result" | sort -u | sed '/^$/d')
 	printf -v "$cache_var" '%s' "${result:--}"
-	echo "$result"
+	[ -n "$result" ] && echo "$result"
+	return 0
 }
 
 # Session-identity flag name patterns per tool.
@@ -586,6 +872,7 @@ _discover_session_flags() {
 SESSION_FLAG_PATTERN_claude='^--(resume|continue|session-id|fork-session|from-pr)$'
 SESSION_FLAG_PATTERN_opencode='^--session$'
 SESSION_FLAG_PATTERN_pi='^--(session|resume|continue|fork)$'
+SESSION_FLAG_PATTERN_omp='^--(session|resume|continue|fork)$'
 # codex uses subcommands (resume, fork), not --flags — handled separately.
 SESSION_SUBCMD_PATTERN_codex='resume|fork'
 # Codex resume/fork have subcommand-specific picker flags that must also
@@ -601,6 +888,10 @@ SESSION_FLAGS_FALLBACK_claude="--continue -c
 --session-id"
 SESSION_FLAGS_FALLBACK_opencode="--session -s"
 SESSION_FLAGS_FALLBACK_pi="--continue -c
+--fork
+--resume -r
+--session"
+SESSION_FLAGS_FALLBACK_omp="--continue -c
 --fork
 --resume -r
 --session"
@@ -692,11 +983,12 @@ extract_cli_args() {
 resolve_pane_candidates() {
 	local pane_target="$1"
 	local pane_cwd="$2"
-	local pane_candidates="$3"
-	local us="$4"
-	local has_assoc_cache="$5"
-	local state_cache_file="$6"
-	local parts_file="$7"
+	local pane_tty="$3"
+	local pane_candidates="$4"
+	local us="$5"
+	local has_assoc_cache="$6"
+	local state_cache_file="$7"
+	local parts_file="$8"
 
 	local resolved=0 first_tool="" first_pid=""
 	for pass in 1 2; do
@@ -739,6 +1031,7 @@ resolve_pane_candidates() {
 				;;
 			codex) session_id=$(get_codex_session "$cand_pid" "$cand_args" "$pane_cwd") ;;
 			pi) session_id=$(get_pi_session "$cand_pid" "$cand_args" "$pane_cwd") ;;
+			omp) session_id=$(get_omp_session "$cand_pid" "$cand_args" "$pane_cwd" "$pane_tty") ;;
 			esac
 
 			if [ -n "$session_id" ]; then
@@ -773,6 +1066,7 @@ resolve_pane_candidates() {
 				case "$cand_tool" in
 				codex) register_codex_session_id "$session_id" ;;
 				pi) register_pi_session_id "$session_id" ;;
+				omp) register_omp_session_id "$session_id" ;;
 				esac
 				resolved=1
 				break
@@ -805,13 +1099,13 @@ main() {
 		rm -f "$PS_FILE" "$PANE_FILE" "$PARTS_FILE"
 		return 1
 	fi
-	tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}|#{pane_pid}|#{pane_current_path}" >"$PANE_FILE"
+	tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}|#{pane_pid}|#{pane_current_path}|#{pane_tty}" >"$PANE_FILE"
 
 	# --- Single awk pass: detect assistant tools across ALL pane process trees ---
 	# Replaces ~200 separate echo|awk pipe invocations with one pass.
 	# Reads pane list + ps snapshot, builds process tree in memory,
 	# BFS-walks descendants for each pane PID, detects tools.
-	# Output (tab-delimited): target\ttool\ttool_pid\ttool_args\tcwd
+	# Output (tab-delimited): target\ttool\ttool_pid\ttool_args\tcwd\tpane_tty
 	# NOTE: emit all candidates per pane (pane PID + descendants) in BFS order.
 	# The shell pass below preserves legacy two-pass OpenCode behavior:
 	# 1) PID-specific only, then 2) DB fallback.
@@ -822,6 +1116,7 @@ main() {
 			split($0, p, "|")
 			pane_target[p[2]] = p[1]
 			pane_cwd[p[2]] = p[3]
+			pane_tty[p[2]] = p[4]
 			pane_list[++pane_count] = p[2]
 			next
 		}
@@ -841,20 +1136,23 @@ main() {
 			# Keep patterns aligned with detect_tool() in lib-detect.sh:
 			# - bare binary at start, or path component (/tool)
 			# - opencode excludes "opencode run " subprocesses
+			# - omp excludes hidden "__omp_worker_" subprocesses
 			if      (line ~ /(^claude( |$)|\/claude( |$))/)                                      proc_tool[pid] = "claude"
 			else if (line ~ /(^opencode( |$)|\/opencode( |$))/ && line !~ /opencode run /)       proc_tool[pid] = "opencode"
 			else if (line ~ /(^codex( |$)|\/codex( |$))/)                                        proc_tool[pid] = "codex"
 			else if (line ~ /(^pi( |$)|\/pi( |$))/)                                              proc_tool[pid] = "pi"
+			else if (line ~ /(^omp( |$)|\/omp( |$))/ && line !~ /__omp_worker_/)                 proc_tool[pid] = "omp"
 		}
 		END {
 			for (i = 1; i <= pane_count; i++) {
 				root = pane_list[i]+0
 				target = pane_target[pane_list[i]]
 				cwd = pane_cwd[pane_list[i]]
+				tty = pane_tty[pane_list[i]]
 
 				# Check pane PID itself (handles exec-replaced shells)
 				if (root in proc_tool && proc_tool[root] != "") {
-					printf "%s\t%s\t%d\t%s\t%s\n", target, proc_tool[root], root, proc_args[root], cwd
+					printf "%s\t%s\t%d\t%s\t%s\t%s\n", target, proc_tool[root], root, proc_args[root], cwd, tty
 				}
 
 				# BFS through descendant processes
@@ -871,7 +1169,7 @@ main() {
 				while (qs <= qe) {
 					cur = queue[qs++]+0
 					if (cur in proc_tool && proc_tool[cur] != "") {
-						printf "%s\t%s\t%d\t%s\t%s\n", target, proc_tool[cur], cur, proc_args[cur], cwd
+						printf "%s\t%s\t%d\t%s\t%s\t%s\n", target, proc_tool[cur], cur, proc_args[cur], cwd, tty
 					}
 					if (cur in child_list) {
 						nc = split(child_list[cur], kids, SUBSEP)
@@ -936,18 +1234,19 @@ main() {
 
 	# Process only matched panes (those with a detected tool)
 	if [ -n "$MATCHES" ]; then
-		local current_target="" current_cwd="" pane_candidates=""
-		while IFS=$'\t' read -r target tool cpid cargs cwd; do
+		local current_target="" current_cwd="" current_tty="" pane_candidates=""
+		while IFS=$'\t' read -r target tool cpid cargs cwd tty; do
 			[ -z "$target" ] && continue
 
 			# If pane changed, process the previous pane's candidate list.
 			if [ -n "$current_target" ] && [ "$target" != "$current_target" ]; then
-				resolve_pane_candidates "$current_target" "$current_cwd" "$pane_candidates" "$US" "$HAS_ASSOC_CACHE" "$STATE_CACHE_FILE" "$PARTS_FILE"
+				resolve_pane_candidates "$current_target" "$current_cwd" "$current_tty" "$pane_candidates" "$US" "$HAS_ASSOC_CACHE" "$STATE_CACHE_FILE" "$PARTS_FILE"
 				pane_candidates=""
 			fi
 
 			current_target="$target"
 			current_cwd="$cwd"
+			current_tty="$tty"
 			# Candidate tuples are US-delimited; a literal \x1f inside process args
 			# would break parsing, but this is practically unlikely for CLI argv.
 			pane_candidates="${pane_candidates}${tool}${US}${cpid}${US}${cargs}"$'\n'
@@ -955,7 +1254,7 @@ main() {
 
 		# Process final pane candidate list.
 		if [ -n "$current_target" ] && [ -n "$pane_candidates" ]; then
-			resolve_pane_candidates "$current_target" "$current_cwd" "$pane_candidates" "$US" "$HAS_ASSOC_CACHE" "$STATE_CACHE_FILE" "$PARTS_FILE"
+			resolve_pane_candidates "$current_target" "$current_cwd" "$current_tty" "$pane_candidates" "$US" "$HAS_ASSOC_CACHE" "$STATE_CACHE_FILE" "$PARTS_FILE"
 		fi
 	fi
 

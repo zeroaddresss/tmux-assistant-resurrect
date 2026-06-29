@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y \
     gcc \
     make \
     ca-certificates \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js 22.x (Pi requires >= 22.19.0; Ubuntu 24.04 ships Node 18)
@@ -38,14 +39,20 @@ RUN BASH32_SHA256="26c99025b59e30779300b68adb764f824974d267a4d7cc1b347d14a2393f9
 # Install just
 RUN curl -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
 
+# Install Bun (Oh My Pi's published `omp` bin uses a Bun shebang).
+RUN curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.14" \
+    && install -m 0755 /root/.bun/bin/bun /usr/local/bin/bun \
+    && rm -rf /root/.bun
+
 # Install real assistant CLIs (no mocks)
 # Pin major versions to prevent upstream breaking changes from failing CI.
-# codex is pre-1.0 (0.x), so pin to ~0 (any 0.x); claude-code is 2.x; opencode-ai is 1.x;
-# pi-coding-agent is 0.x (requires Node >= 22.19.0).
-RUN npm install -g "@anthropic-ai/claude-code@^2" "@openai/codex@^0" "opencode-ai@^1" "@earendil-works/pi-coding-agent@^0"
+# codex is pre-1.0 (0.x), so pin to ~0 (any 0.x); claude-code is 2.x;
+# opencode-ai is 1.x; pi-coding-agent is 0.x (requires Node >= 22.19.0);
+# Oh My Pi is 16.x and requires Bun for its `omp` entrypoint.
+RUN npm install -g "@anthropic-ai/claude-code@^2" "@openai/codex@^0" "opencode-ai@^1" "@earendil-works/pi-coding-agent@^0" "@oh-my-pi/pi-coding-agent@^16"
 
 # Verify the binaries exist
-RUN which claude && which codex && which opencode && which pi
+RUN which claude && which codex && which opencode && which pi && which omp && omp --version
 
 # Create a test user (avoid running as root — tmux behaves differently)
 RUN useradd -m -s /bin/bash testuser

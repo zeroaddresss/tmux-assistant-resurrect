@@ -1,5 +1,5 @@
 # tmux-assistant-resurrect — session persistence for AI coding assistants
-# Preserves Claude Code, OpenCode, Codex CLI, and Pi sessions across tmux restarts.
+# Preserves Claude Code, OpenCode, Codex CLI, Pi, and Oh My Pi sessions across tmux restarts.
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
@@ -42,7 +42,7 @@ install-plugins:
         echo "TPM not found — run 'just install-tpm' first, then press prefix+I in tmux"; \
     fi
 
-# Install assistant integrations (Claude hook + OpenCode plugin; Pi needs no hook)
+# Install assistant integrations (Claude hook + OpenCode plugin; Pi/Oh My Pi need no hook)
 install-hooks: install-claude-hook install-opencode-plugin
     @echo "All assistant hooks installed"
 

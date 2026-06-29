@@ -2,8 +2,8 @@
 
 > **Disclaimer**: This project was entirely vibecoded (designed and implemented
 > through conversation with AI coding assistants). It has been end-to-end tested
-> in Docker with real CLI binaries (Claude/OpenCode/Codex/Pi)
-> (300+ automated tests + full save/kill/restore lifecycle smoke test),
+> in Docker with real CLI binaries (Claude/OpenCode/Codex/Pi/Oh My Pi)
+> (350+ automated tests + full save/kill/restore lifecycle smoke test),
 > but has **limited real-world usage** so far. Expect
 > rough edges. Contributions and bug reports welcome.
 
@@ -14,8 +14,9 @@ Persist and restore AI coding assistant sessions across tmux restarts and reboot
 When your computer shuts down, tmux sessions are lost -- including any running
 [Claude Code](https://github.com/anthropics/claude-code),
 [OpenCode](https://github.com/opencode-ai/opencode),
-[Codex CLI](https://github.com/openai/codex), or
-[Pi](https://github.com/mariozechner/pi) instances. This project hooks into
+[Codex CLI](https://github.com/openai/codex),
+[Pi](https://github.com/mariozechner/pi), or
+[Oh My Pi](https://github.com/can1357/oh-my-pi) instances. This project hooks into
 [tmux-resurrect](https://github.com/tmux-plugins/tmux-resurrect) to
 automatically save assistant session IDs, CLI flags, and environment variables,
 then re-launch them with the exact same configuration after a restore.
@@ -26,7 +27,7 @@ then re-launch them with the exact same configuration after a restore.
 SAVE (every 5 min + manual prefix+Ctrl-s)
   tmux-resurrect saves pane layouts
     -> post-save hook inspects child processes of each pane
-    -> detects assistants by binary name (claude, opencode, codex, pi)
+    -> detects assistants by binary name (claude, opencode, codex, pi, omp)
     -> extracts session IDs via native hooks/plugins/process args
     -> writes assistant-sessions.json in tmux-resurrect's save dir
 
@@ -39,13 +40,14 @@ RESTORE (on tmux start or manual prefix+Ctrl-r)
          opencode --verbose -s <session-id>
          codex --full-auto resume <session-id>
          pi --model sonnet --session <session-id>
+         omp --profile work --resume <session-id>
 ```
 
 ## Design
 
 Detection is done via direct process inspection: the save script takes a
 single `ps` snapshot of all processes, finds children of each tmux pane shell,
-and matches known assistant binary names (`claude`, `opencode`, `codex`, `pi`).
+and matches known assistant binary names (`claude`, `opencode`, `codex`, `pi`, `omp`).
 
 Session ID extraction uses tool-native mechanisms (infrastructure plumbing):
 
@@ -55,6 +57,7 @@ Session ID extraction uses tool-native mechanisms (infrastructure plumbing):
 | **OpenCode** | `-s` / `--session` in process args | Plugin state file | SQLite DB query (`~/.local/share/opencode/opencode.db`) | Go binary overwrites process title; DB fallback matches most recent session by cwd |
 | **Codex CLI** | PID lookup in `~/.codex/session-tags.jsonl` | `resume` in process args | - | Codex runs via Node.js, so args are always visible in `ps` |
 | **Pi** | Session header lookup in `~/.pi/agent/sessions/--<cwd>--/*.jsonl` | `--session` in process args | - | Session-file lookup is cwd-scoped and uses process-time scoring + dedup |
+| **Oh My Pi** | Terminal breadcrumb + session JSONL lookup (`$XDG_STATE_HOME/omp`, `$XDG_DATA_HOME/omp`) | `--resume` / `-r` in process args | `--session-dir` / `--profile` scoped lookup | Distinct `omp` tool; no hook/plugin required |
 
 Each tool has a primary and fallback extraction method. Fallbacks address the
 chicken-and-egg problem: after a restore, session IDs are in process args even
@@ -66,7 +69,7 @@ version-resilient session ID extraction even when the plugin hasn't fired.
 - [tmux](https://github.com/tmux/tmux) (tested with 3.x)
 - [TPM](https://github.com/tmux-plugins/tpm) (Tmux Plugin Manager)
 - [jq](https://jqlang.github.io/jq/) (used by save/restore scripts)
-- At least one of: Claude Code, OpenCode, Codex CLI, Pi
+- At least one of: Claude Code, OpenCode, Codex CLI, Pi, Oh My Pi
 
 ## Installation
 
@@ -100,6 +103,7 @@ and automatically set up:
 - Claude Code hooks in `~/.claude/settings.json`
 - OpenCode session-tracker plugin in `~/.config/opencode/plugins/`
 - Pi support via session-file lookup in `~/.pi/agent/sessions` (no hook/plugin required)
+- Oh My Pi support via terminal/session-file lookup in `$XDG_STATE_HOME/omp`, `$XDG_DATA_HOME/omp`, or `~/.omp` (no hook/plugin required)
 
 ## Uninstallation
 

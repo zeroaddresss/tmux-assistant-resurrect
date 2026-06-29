@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Integration tests for tmux-assistant-resurrect.
-# Runs inside Docker with real assistant CLI binaries (claude/opencode/codex/pi).
+# Runs inside Docker with real assistant CLI binaries (claude/opencode/codex/pi/omp).
 set -euo pipefail
 
 REPO_DIR="$HOME/tmux-assistant-resurrect"
@@ -275,6 +275,9 @@ tmux new-session -d -s test-false-positive -c /tmp
 PI_TEST_CWD="/tmp/pi-session-test-cwd"
 mkdir -p "$PI_TEST_CWD"
 tmux new-session -d -s test-pi -c "$PI_TEST_CWD"
+OMP_TEST_CWD="/tmp/omp-session-test-cwd"
+mkdir -p "$OMP_TEST_CWD"
+tmux new-session -d -s test-omp -c "$OMP_TEST_CWD"
 
 # Launch mock assistants inside tmux panes
 # Claude: just a bare claude process (session ID comes from hook state file)
@@ -284,14 +287,16 @@ tmux send-keys -t test-claude "claude --resume ses_claude_test_123" Enter
 tmux send-keys -t test-opencode "opencode -s ses_opencode_test_456" Enter
 # Codex: bare process (session ID comes from session-tags.jsonl)
 tmux send-keys -t test-codex "codex resume ses_codex_test_789" Enter
-# OpenCode without -s flag (no session ID available — should log warning)
-tmux send-keys -t test-opencode-nosid "opencode" Enter
+# OpenCode without -s flag (no session ID available — should log warning).
+tmux send-keys -t test-opencode-nosid "bash -c 'exec -a opencode cat'" Enter
 # OpenCode LSP subprocess (should be excluded from detection)
 tmux send-keys -t test-lsp "opencode run pyright-langserver.js" Enter
 # Command line mentioning "codex" as a value (must NOT be detected as Codex)
 tmux send-keys -t test-false-positive "python3 -c 'import time; time.sleep(300)' --profile codex" Enter
 # Pi: real pi binary in offline mode (stays alive as TUI without API key)
 tmux send-keys -t test-pi "pi --offline" Enter
+# OMP: argv-only harmless process; real omp binary is still used by help discovery.
+tmux send-keys -t test-omp "bash -c 'exec -a omp cat'" Enter
 
 # Wait for each assistant to appear as a child process (replaces fixed sleep 4).
 # OpenCode spawns node → native binary chain, so it takes longer than claude/codex.
@@ -300,15 +305,21 @@ opencode_pane_shell_pid=$(tmux display-message -t test-opencode -p '#{pane_pid}'
 codex_pane_shell_pid=$(tmux display-message -t test-codex -p '#{pane_pid}')
 nosid_pane_shell_pid=$(tmux display-message -t test-opencode-nosid -p '#{pane_pid}')
 pi_pane_shell_pid=$(tmux display-message -t test-pi -p '#{pane_pid}')
+omp_pane_shell_pid=$(tmux display-message -t test-omp -p '#{pane_pid}')
 
 wait_for_child "$claude_pane_shell_pid" "claude" 10 >/dev/null || echo "WARN: claude child not found (may still work via tree walk)"
 wait_for_child "$opencode_pane_shell_pid" "opencode" 10 >/dev/null || echo "WARN: opencode child not found"
 wait_for_child "$codex_pane_shell_pid" "codex" 10 >/dev/null || echo "WARN: codex child not found"
 wait_for_child "$nosid_pane_shell_pid" "opencode" 10 >/dev/null || echo "WARN: opencode-nosid child not found"
-if wait_for_child "$pi_pane_shell_pid" "(^| )pi( |$)" 10 >/dev/null; then
+if wait_for_descendant "$pi_pane_shell_pid" 10 >/dev/null; then
 	pass "Pi process is running in test-pi pane"
 else
 	fail "Pi process not found in test-pi pane"
+fi
+if wait_for_child "$omp_pane_shell_pid" "(^| )omp( |$)" 10 >/dev/null; then
+	pass "OMP process is running in test-omp pane"
+else
+	fail "OMP process not found in test-omp pane"
 fi
 
 # Create a Claude hook state file keyed by the Claude child PID
@@ -356,6 +367,18 @@ cat >"$pi_session_file" <<EOF
 {"type":"message","id":"pi-msg-1","parentId":null,"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}
 EOF
 
+# Create an OMP session file in its temp-relative cwd-scoped sessions directory.
+omp_sid="019e99omp-test-0001"
+omp_safe_cwd=$(echo "${OMP_TEST_CWD#/tmp/}" | sed -e 's#[/\\:]#-#g')
+omp_session_dir="$HOME/.omp/agent/sessions/-tmp-${omp_safe_cwd}"
+mkdir -p "$omp_session_dir"
+rm -f "$omp_session_dir"/*.jsonl 2>/dev/null || true
+omp_session_file="$omp_session_dir/$(date -u +%Y-%m-%dT%H-%M-%S)_${omp_sid}.jsonl"
+cat >"$omp_session_file" <<EOF
+{"type":"session","version":3,"id":"${omp_sid}","timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","cwd":"${OMP_TEST_CWD}"}
+{"type":"message","id":"omp-msg-1","parentId":null,"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}
+EOF
+
 # Run save
 just save 2>&1
 
@@ -364,13 +387,13 @@ SAVED="$HOME/.tmux/resurrect/assistant-sessions.json"
 assert_file_exists "assistant-sessions.json created" "$SAVED"
 
 session_count=$(jq '.sessions | length' "$SAVED")
-# We expect: claude (1) + opencode with -s (1) + codex (1) + pi (1) = 4 with session IDs
+# We expect: claude (1) + opencode with -s (1) + codex (1) + pi (1) + omp (1) = 5 with session IDs
 # opencode-nosid detected but no session ID, so excluded from sessions array
 # lsp subprocess should be excluded entirely
-if [ "$session_count" -ge 4 ]; then
-	pass "Detected at least 4 assistant sessions (got $session_count)"
+if [ "$session_count" -ge 5 ]; then
+	pass "Detected at least 5 assistant sessions (got $session_count)"
 else
-	fail "Expected at least 4 sessions, got $session_count"
+	fail "Expected at least 5 sessions, got $session_count"
 fi
 
 # Verify Claude was detected with correct session ID
@@ -389,6 +412,10 @@ assert_eq "Codex session ID extracted from session-tags.jsonl" "ses_codex_test_7
 pi_detected_sid=$(jq -r '.sessions[] | select(.tool == "pi") | .session_id' "$SAVED")
 assert_eq "Pi session ID extracted from session file" "$pi_sid" "$pi_detected_sid"
 
+# Verify OMP was detected with correct session ID (from ~/.omp session file)
+omp_detected_sid=$(jq -r '.sessions[] | select(.tool == "omp") | .session_id' "$SAVED")
+assert_eq "OMP session ID extracted" "$omp_sid" "$omp_detected_sid"
+
 # Verify LSP subprocess was excluded
 lsp_count=$(jq '[.sessions[] | select(.pane | contains("test-lsp"))] | length' "$SAVED")
 assert_eq "LSP subprocess excluded from detection" "0" "$lsp_count"
@@ -404,6 +431,9 @@ if grep -q "no session ID available" "$LOG"; then
 else
 	fail "Expected log warning about missing session ID"
 fi
+
+saved_after_test2=$(mktemp)
+cp "$SAVED" "$saved_after_test2"
 
 # --- Test 2b: Save detects assistants launched via wrappers (npx) ---
 
@@ -463,6 +493,8 @@ npx_sid=$(jq -r '.sessions[] | select(.pane | contains("test-npx")) | .session_i
 assert_eq "Save detects opencode launched via npx" "ses_npx_wrapper" "$npx_sid"
 
 kill_pane_children test-npx true
+cp "$saved_after_test2" "$HOME/.tmux/resurrect/assistant-sessions.json"
+rm -f "$saved_after_test2"
 
 # --- Test 3: Restore — sends correct resume commands ---
 
@@ -472,7 +504,7 @@ echo "=== Test 3: restore (resume commands) ==="
 echo ""
 
 # Kill all assistants first (so panes are empty shells)
-for sess in test-claude test-opencode test-codex test-opencode-nosid test-lsp test-false-positive test-pi; do
+for sess in test-claude test-opencode test-codex test-opencode-nosid test-lsp test-false-positive test-pi test-omp; do
 	kill_pane_children "$sess"
 done
 sleep 1
@@ -488,10 +520,12 @@ RESTORE_LOG="$HOME/.tmux/resurrect/assistant-restore.log"
 assert_file_exists "Restore log created" "$RESTORE_LOG"
 
 restore_log_content=$(cat "$RESTORE_LOG")
+omp_restore_line=$(echo "$restore_log_content" | grep "restoring omp" || true)
 assert_contains "Restore log mentions claude" "$restore_log_content" "restoring claude"
 assert_contains "Restore log mentions opencode" "$restore_log_content" "restoring opencode"
 assert_contains "Restore log mentions codex" "$restore_log_content" "restoring codex"
 assert_contains "Restore log mentions pi" "$restore_log_content" "restoring pi"
+assert_contains "Restore log mentions omp" "$restore_log_content" "restoring omp"
 
 # Verify the restore log contains the correct resume commands
 # (pane content is unreliable — real CLIs take over the terminal and clear it)
@@ -499,12 +533,15 @@ assert_contains "Restore sent claude --resume" "$restore_log_content" "ses_claud
 assert_contains "Restore sent opencode -s" "$restore_log_content" "ses_opencode_test_456"
 assert_contains "Restore sent codex resume" "$restore_log_content" "ses_codex_test_789"
 assert_contains "Restore sent pi --session" "$restore_log_content" "$pi_sid"
+assert_contains "Restore sent omp session ID" "$omp_restore_line" "$omp_sid"
+assert_contains "Restore sent omp --resume" "$omp_restore_line" "--resume"
 
 # Verify restore uses 'command' prefix to bypass shell aliases
 assert_contains "Restore uses 'command claude' prefix" "$restore_log_content" "command claude"
 assert_contains "Restore uses 'command opencode' prefix" "$restore_log_content" "command opencode"
 assert_contains "Restore uses 'command codex' prefix" "$restore_log_content" "command codex"
 assert_contains "Restore uses 'command pi' prefix" "$restore_log_content" "command pi"
+assert_contains "Restore uses 'command omp' prefix" "$omp_restore_line" "command omp"
 
 # --- Test 3b: Restore skips panes with already-running assistants ---
 
@@ -539,7 +576,7 @@ echo "=== Test 3b2: restore Guard 2 — skips panes with background assistant ==
 echo ""
 
 # Kill existing assistants so panes return to shells
-for sess in test-claude test-opencode test-codex test-opencode-nosid test-lsp test-pi; do
+for sess in test-claude test-opencode test-codex test-opencode-nosid test-lsp test-pi test-omp; do
 	kill_pane_children "$sess"
 done
 sleep 1
@@ -588,7 +625,7 @@ echo "=== Test 3c: restore handles tricky cwd values ==="
 echo ""
 
 # Kill assistants so panes are clean shells
-for sess in test-claude test-opencode test-codex test-opencode-nosid test-lsp test-pi; do
+for sess in test-claude test-opencode test-codex test-opencode-nosid test-lsp test-pi test-omp; do
 	kill_pane_children "$sess"
 done
 sleep 1
@@ -646,7 +683,7 @@ echo ""
 bash "$REPO_DIR/tmux-assistant-resurrect.tmux"
 
 resurrect_procs=$(tmux show-option -gv @resurrect-processes 2>/dev/null || echo "")
-if echo "$resurrect_procs" | grep -qiE "claude|opencode|codex|pi"; then
+if echo "$resurrect_procs" | grep -qiE "claude|opencode|codex|pi|omp"; then
 	fail "@resurrect-processes still contains assistants (double-launch risk!)"
 else
 	pass "@resurrect-processes does not include assistants"
@@ -1280,6 +1317,100 @@ else
 fi
 USED_PI_SESSION_IDS=""
 
+# --- OMP: resume args + session-file lookup ---
+assert_eq "OMP --resume extraction" "019e99omp_resume" "$(get_omp_session 99999 "omp --resume 019e99omp_resume" "/tmp/omp-project" "")"
+assert_eq "OMP --resume=id extraction" "019e99omp_resume_eq" "$(get_omp_session 99999 "omp --resume=019e99omp_resume_eq" "/tmp/omp-project" "")"
+assert_eq "OMP -r extraction" "019e99omp_short" "$(get_omp_session 99999 "omp -r 019e99omp_short" "/tmp/omp-project" "")"
+assert_eq "OMP hidden --session extraction" "019e99omp_session" "$(get_omp_session 99999 "omp --session 019e99omp_session" "/tmp/omp-project" "")"
+assert_eq "OMP hidden --session=id extraction" "019e99omp_session_eq" "$(get_omp_session 99999 "omp --session=019e99omp_session_eq" "/tmp/omp-project" "")"
+
+OLD_XDG_DATA_HOME="${XDG_DATA_HOME-}"
+OLD_XDG_DATA_HOME_SET="${XDG_DATA_HOME+x}"
+OLD_XDG_STATE_HOME="${XDG_STATE_HOME-}"
+OLD_XDG_STATE_HOME_SET="${XDG_STATE_HOME+x}"
+OLD_PI_CONFIG_DIR="${PI_CONFIG_DIR-}"
+OLD_PI_CONFIG_DIR_SET="${PI_CONFIG_DIR+x}"
+OLD_PI_CODING_AGENT_DIR="${PI_CODING_AGENT_DIR-}"
+OLD_PI_CODING_AGENT_DIR_SET="${PI_CODING_AGENT_DIR+x}"
+unset XDG_DATA_HOME XDG_STATE_HOME PI_CONFIG_DIR PI_CODING_AGENT_DIR
+
+write_omp_session_header() {
+	local path="$1"
+	local sid="$2"
+	local cwd="$3"
+	mkdir -p "$(dirname "$path")"
+	cat >"$path" <<OMPEOF
+{"type":"session","version":3,"id":"${sid}","timestamp":"2026-01-01T00:00:00Z","cwd":"${cwd}"}
+OMPEOF
+}
+
+OMP_HOME_CWD="$HOME/work/omp-home-project"
+write_omp_session_header "$HOME/.omp/agent/sessions/-work-omp-home-project/home.jsonl" "019e99omp_home" "$OMP_HOME_CWD"
+assert_eq "OMP default home-relative directory lookup" "019e99omp_home" "$(get_omp_session $$ "omp" "$OMP_HOME_CWD" "")"
+
+OMP_TEMP_CWD="/tmp/omp-unit-temp"
+write_omp_session_header "$HOME/.omp/agent/sessions/-tmp-omp-unit-temp/temp.jsonl" "019e99omp_temp" "$OMP_TEMP_CWD"
+assert_eq "OMP temp-relative directory lookup" "019e99omp_temp" "$(get_omp_session $$ "omp" "$OMP_TEMP_CWD" "")"
+
+OMP_CUSTOM_CWD="/tmp/omp-custom-cwd"
+OMP_CUSTOM_DIR="$HOME/custom-omp-sessions"
+write_omp_session_header "$OMP_CUSTOM_DIR/custom.jsonl" "019e99omp_custom" "$OMP_CUSTOM_CWD"
+assert_eq "OMP --session-dir lookup" "019e99omp_custom" "$(get_omp_session $$ "omp --session-dir $OMP_CUSTOM_DIR" "$OMP_CUSTOM_CWD" "")"
+
+OMP_PROFILE_CWD="/tmp/omp-profile"
+write_omp_session_header "$HOME/.omp/profiles/work/agent/sessions/-tmp-omp-profile/profile.jsonl" "019e99omp_profile" "$OMP_PROFILE_CWD"
+assert_eq "OMP --profile lookup" "019e99omp_profile" "$(get_omp_session $$ "omp --profile work" "$OMP_PROFILE_CWD" "")"
+
+OMP_TITLE_CWD="/tmp/omp-title-slot"
+mkdir -p "$HOME/.omp/agent/sessions/-tmp-omp-title-slot"
+cat >"$HOME/.omp/agent/sessions/-tmp-omp-title-slot/title.jsonl" <<'OMPTITLE'
+{"type":"title","title":"fixed-width slot"}
+{"type":"session","version":3,"id":"019e99omp_title","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/omp-title-slot"}
+OMPTITLE
+assert_eq "OMP title-slot-before-header lookup" "019e99omp_title" "$(get_omp_session $$ "omp" "$OMP_TITLE_CWD" "")"
+
+OMP_BREADCRUMB_CWD="/tmp/omp-breadcrumb"
+OMP_BREADCRUMB_DIR="$HOME/.omp/agent/sessions/-tmp-omp-breadcrumb"
+write_omp_session_header "$OMP_BREADCRUMB_DIR/cwd.jsonl" "019e99omp_cwd_scan" "$OMP_BREADCRUMB_CWD"
+write_omp_session_header "$OMP_BREADCRUMB_DIR/breadcrumb.jsonl" "019e99omp_breadcrumb" "$OMP_BREADCRUMB_CWD"
+mkdir -p "$HOME/.omp/agent/terminal-sessions"
+printf '%s\n%s\n' "$OMP_BREADCRUMB_CWD" "$OMP_BREADCRUMB_DIR/breadcrumb.jsonl" >"$HOME/.omp/agent/terminal-sessions/pts-55"
+assert_eq "OMP terminal breadcrumb preferred over cwd scan" "019e99omp_breadcrumb" "$(get_omp_session $$ "omp" "$OMP_BREADCRUMB_CWD" "/dev/pts/55")"
+
+USED_OMP_SESSION_IDS=""
+OMP_DEDUP_CWD="/tmp/omp-dedup"
+OMP_DEDUP_DIR="$HOME/.omp/agent/sessions/-tmp-omp-dedup"
+write_omp_session_header "$OMP_DEDUP_DIR/old.jsonl" "019e99omp_dedup_old" "$OMP_DEDUP_CWD"
+sleep 1
+write_omp_session_header "$OMP_DEDUP_DIR/new.jsonl" "019e99omp_dedup_new" "$OMP_DEDUP_CWD"
+omp_first=$(get_omp_session $$ "omp" "$OMP_DEDUP_CWD" "")
+register_omp_session_id "$omp_first"
+omp_second=$(get_omp_session $$ "omp" "$OMP_DEDUP_CWD" "")
+if [ -n "$omp_first" ] && [ -n "$omp_second" ] && [ "$omp_first" != "$omp_second" ]; then
+	pass "OMP dedup: two panes same cwd get distinct sessions"
+else
+	fail "OMP dedup: expected distinct sessions, got '$omp_first' and '$omp_second'"
+fi
+USED_OMP_SESSION_IDS=""
+
+export XDG_DATA_HOME="$HOME/xdg-data"
+export XDG_STATE_HOME="$HOME/xdg-state"
+mkdir -p "$XDG_DATA_HOME/omp" "$XDG_STATE_HOME/omp"
+OMP_XDG_DATA_CWD="/tmp/omp-xdg-data"
+write_omp_session_header "$XDG_DATA_HOME/omp/sessions/-tmp-omp-xdg-data/data.jsonl" "019e99omp_xdg_data" "$OMP_XDG_DATA_CWD"
+assert_eq "OMP XDG default data root lookup" "019e99omp_xdg_data" "$(get_omp_session $$ "omp" "$OMP_XDG_DATA_CWD" "")"
+
+OMP_XDG_STATE_CWD="/tmp/omp-xdg-state"
+write_omp_session_header "$XDG_DATA_HOME/omp/sessions/-tmp-omp-xdg-state/state.jsonl" "019e99omp_xdg_state" "$OMP_XDG_STATE_CWD"
+mkdir -p "$XDG_STATE_HOME/omp/terminal-sessions"
+printf '%s\n%s\n' "$OMP_XDG_STATE_CWD" "$XDG_DATA_HOME/omp/sessions/-tmp-omp-xdg-state/state.jsonl" >"$XDG_STATE_HOME/omp/terminal-sessions/pts-56"
+assert_eq "OMP XDG default state breadcrumb lookup" "019e99omp_xdg_state" "$(get_omp_session $$ "omp" "$OMP_XDG_STATE_CWD" "/dev/pts/56")"
+
+if [ -n "$OLD_XDG_DATA_HOME_SET" ]; then export XDG_DATA_HOME="$OLD_XDG_DATA_HOME"; else unset XDG_DATA_HOME; fi
+if [ -n "$OLD_XDG_STATE_HOME_SET" ]; then export XDG_STATE_HOME="$OLD_XDG_STATE_HOME"; else unset XDG_STATE_HOME; fi
+if [ -n "$OLD_PI_CONFIG_DIR_SET" ]; then export PI_CONFIG_DIR="$OLD_PI_CONFIG_DIR"; else unset PI_CONFIG_DIR; fi
+if [ -n "$OLD_PI_CODING_AGENT_DIR_SET" ]; then export PI_CODING_AGENT_DIR="$OLD_PI_CODING_AGENT_DIR"; else unset PI_CODING_AGENT_DIR; fi
+
 export HOME="$REAL_HOME"
 rm -rf "$PI_UNIT_HOME"
 
@@ -1696,6 +1827,7 @@ awk_detect_tool_save() {
 			else if ($0 ~ /(^opencode( |$)|\/opencode( |$))/ && $0 !~ /opencode run /)      print "opencode"
 			else if ($0 ~ /(^codex( |$)|\/codex( |$))/)                                      print "codex"
 			else if ($0 ~ /(^pi( |$)|\/pi( |$))/)                                            print "pi"
+			else if ($0 ~ /(^omp( |$)|\/omp( |$))/ && $0 !~ /__omp_worker_/)              print "omp"
 		}
 	'
 }
@@ -1705,27 +1837,32 @@ assert_eq "detect bare 'claude'" "claude" "$(detect_tool "claude")"
 assert_eq "detect bare 'opencode'" "opencode" "$(detect_tool "opencode")"
 assert_eq "detect bare 'codex'" "codex" "$(detect_tool "codex")"
 assert_eq "detect bare 'pi'" "pi" "$(detect_tool "pi")"
+assert_eq "detect bare 'omp'" "omp" "$(detect_tool "omp")"
 
 # Bare names with arguments
 assert_eq "detect 'claude --resume ses_123'" "claude" "$(detect_tool "claude --resume ses_123")"
 assert_eq "detect 'opencode -s ses_456'" "opencode" "$(detect_tool "opencode -s ses_456")"
 assert_eq "detect 'codex resume ses_789'" "codex" "$(detect_tool "codex resume ses_789")"
 assert_eq "detect 'pi --session 019e99-test'" "pi" "$(detect_tool "pi --session 019e99-test")"
+assert_eq "detect 'omp --resume 019e99-test'" "omp" "$(detect_tool "omp --resume 019e99-test")"
 
 # Full paths (how they appear on macOS or via shebang)
 assert_eq "detect '/usr/local/bin/claude'" "claude" "$(detect_tool "/usr/local/bin/claude")"
 assert_eq "detect '/opt/homebrew/bin/opencode -s ses_456'" "opencode" "$(detect_tool "/opt/homebrew/bin/opencode -s ses_456")"
 assert_eq "detect '/bin/bash /usr/local/bin/opencode -s ses_456'" "opencode" "$(detect_tool "/bin/bash /usr/local/bin/opencode -s ses_456")"
 assert_eq "detect '/usr/local/bin/pi --session 019e99-test'" "pi" "$(detect_tool "/usr/local/bin/pi --session 019e99-test")"
+assert_eq "detect '/usr/local/bin/omp --resume 019e99-test'" "omp" "$(detect_tool "/usr/local/bin/omp --resume 019e99-test")"
 
 # LSP subprocess exclusion
 assert_eq "exclude 'opencode run pyright'" "" "$(detect_tool "opencode run pyright-langserver.js")"
 assert_eq "exclude '/usr/bin/opencode run pyright'" "" "$(detect_tool "/usr/bin/opencode run pyright-langserver.js")"
+assert_eq "exclude OMP worker subprocess" "" "$(detect_tool "omp __omp_worker_tiny_inference")"
 
 # Non-matches
 assert_eq "ignore 'bash'" "" "$(detect_tool "bash")"
 assert_eq "ignore 'vim'" "" "$(detect_tool "vim")"
 assert_eq "ignore 'node server.js'" "" "$(detect_tool "node server.js")"
+assert_eq "ignore arg value 'omp'" "" "$(detect_tool "python3 -c 'import time; time.sleep(300)' --profile omp")"
 
 # Parity guard: detect_tool() and save's awk detector should classify the same
 # representative command lines.
@@ -1739,10 +1876,14 @@ parity_cases=(
 	"/usr/bin/codex resume ses_789|codex"
 	"pi --session 019e99-test|pi"
 	"/usr/local/bin/pi --session 019e99-test|pi"
+	"omp --resume 019e99-test|omp"
+	"/usr/local/bin/omp --resume 019e99-test|omp"
 	"opencode run pyright-langserver.js|"
 	"/usr/bin/opencode run pyright-langserver.js|"
 	"python3 -c 'import time; time.sleep(300)' --profile codex|"
 	"python3 -c 'import time; time.sleep(300)' --profile pi|"
+	"python3 -c 'import time; time.sleep(300)' --profile omp|"
+	"omp __omp_worker_tiny_inference|"
 	"/tmp/tools/codex-helper --foo|"
 )
 
@@ -2637,6 +2778,18 @@ assert_eq "Pi strip --fork" "--model sonnet" \
 assert_eq "Pi preserve --session-dir" "--session-dir /tmp/pi-sessions --model sonnet" \
 	"$(extract_cli_args "pi" "pi --session-dir /tmp/pi-sessions --model sonnet --session 019e99pi_test")"
 
+# OMP: public --resume and hidden --session identify the session and are stripped.
+assert_eq "OMP strip --resume" "--model opus" \
+	"$(extract_cli_args "omp" "omp --model opus --resume 019e99omp_test")"
+assert_eq "OMP strip hidden --session" "--model opus" \
+	"$(extract_cli_args "omp" "omp --model opus --session 019e99omp_test")"
+assert_eq "OMP preserve --session-dir/profile/cwd" "--session-dir /tmp/omp-sessions --profile work --cwd /tmp/project" \
+	"$(extract_cli_args "omp" "omp --session-dir /tmp/omp-sessions --profile work --cwd /tmp/project --resume 019e99omp_test")"
+assert_eq "OMP strip --continue" "" \
+	"$(extract_cli_args "omp" "omp --continue")"
+assert_eq "OMP strip -c" "" \
+	"$(extract_cli_args "omp" "omp -c")"
+
 # Codex: bare resume (no id)
 assert_eq "Codex bare resume" "" \
 	"$(extract_cli_args "codex" "codex resume")"
@@ -2714,6 +2867,16 @@ if echo "$_PI_DISCOVERED" | grep -q -- '--session'; then
 else
 	fail "Pi discovery missed --session"
 fi
+
+# OMP: discovery must find the public --resume flag from `omp --help`.
+_OMP_DISCOVERED=$(_discover_session_flags omp "$SESSION_FLAG_PATTERN_omp")
+if echo "$_OMP_DISCOVERED" | grep -q -- '--resume'; then
+	pass "OMP discovery finds --resume"
+else
+	fail "OMP discovery missed --resume"
+fi
+assert_eq "OMP hidden --session stripped" "--model opus" \
+	"$(extract_cli_args "omp" "omp --model opus --session 019e99omp_hidden")"
 
 # Codex: resume/fork subcommands must appear in --help
 CODEX_HELP=$(codex --help 2>&1)
